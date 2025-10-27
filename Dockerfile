@@ -25,4 +25,4 @@ EXPOSE 10000
 RUN rm -rf /root/.cache
 
 # Start bot
-CMD ["python", "bot.py"]
+CMD ["python", "bot2.py"]
