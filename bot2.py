@@ -71,7 +71,7 @@ HOSTS = [
 
 API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8097154751:AAGuySNQNaGXnn_lovQL3qT6LWMmxo6kh8U")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAHjr8lNFKghQNCJl5BlWJ2c-AI3F_uiAKs")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
