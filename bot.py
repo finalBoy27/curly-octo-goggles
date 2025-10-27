@@ -68,7 +68,7 @@ HOSTS = [
 
 API_ID = int(os.getenv("API_ID", 24536446))  # 👈 Replace 123456 with your actual API_ID
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8315426889:AAG0C_H9M2okHnOheMDyl93Gft953js2oXM")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8097154751:AAGuySNQNaGXnn_lovQL3qT6LWMmxo6kh8U")
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -99,37 +99,55 @@ def build_search_url(search_id, query, newer_than, older_than, page=None, older_
     return f"{base_url}?{urlencode(params)}"
 
 def find_view_older_link(html_str: str, title_only: int = 0):
-    tree = HTMLParser(html_str)
-    link_node = tree.css_first("div.block-footer a")
-    if not link_node or not link_node.attributes.get("href"):
-        return None
-    href = link_node.attributes["href"]
-    match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
-    if not match:
-        return None
-    sid, before, q = match.groups()
-    if title_only == 1:
-        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
-    return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+    tree = None
+    try:
+        tree = HTMLParser(html_str)
+        link_node = tree.css_first("div.block-footer a")
+        if not link_node or not link_node.attributes.get("href"):
+            return None
+        href = link_node.attributes["href"]
+        match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
+        if not match:
+            return None
+        sid, before, q = match.groups()
+        if title_only == 1:
+            return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+    finally:
+        if tree:
+            del tree
+        gc.collect()
 
 def get_total_pages(html_str: str):
-    tree = HTMLParser(html_str)
-    nav = tree.css_first("ul.pageNav-main")
-    if not nav:
-        return 1
-    pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
-    return max(pages) if pages else 1
+    tree = None
+    try:
+        tree = HTMLParser(html_str)
+        nav = tree.css_first("ul.pageNav-main")
+        if not nav:
+            return 1
+        pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
+        return max(pages) if pages else 1
+    finally:
+        if tree:
+            del tree
+        gc.collect()
 
 def extract_threads(html_str: str):
-    tree = HTMLParser(html_str)
-    threads = []
-    for a in tree.css("a[href]"):
-        href = a.attributes.get("href", "")
-        if "threads/" in href and not href.startswith("#") and "page-" not in href:
-            full_link = urljoin(BASE_URL, href)
-            if full_link not in threads:
-                threads.append(full_link)
-    return threads
+    tree = None
+    try:
+        tree = HTMLParser(html_str)
+        threads = []
+        for a in tree.css("a[href]"):
+            href = a.attributes.get("href", "")
+            if "threads/" in href and not href.startswith("#") and "page-" not in href:
+                full_link = urljoin(BASE_URL, href)
+                if full_link not in threads:
+                    threads.append(full_link)
+        return threads
+    finally:
+        if tree:
+            del tree
+        gc.collect()
 
 # ───────────────────────────────
 # 🌐 FETCH
@@ -243,42 +261,49 @@ async def process_thread(client: aiohttp.ClientSession, post_url, patterns, sema
         if not html_str:
             return []
         
-        tree = HTMLParser(html_str)
-        articles = tree.css("article.message--post")
-        matched = []
-        
-        for article in articles:
-            post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
-            if post_id == "unknown":
-                continue
+        tree = None
+        try:
+            tree = HTMLParser(html_str)
+            articles = tree.css("article.message--post")
+            matched = []
             
-            is_match = article_matches_patterns(article, patterns)
-            thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
+            for article in articles:
+                post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
+                if post_id == "unknown":
+                    continue
+                
+                is_match = article_matches_patterns(article, patterns)
+                thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
+                
+                if thread_match:
+                    slug = thread_match.group(1)
+                    tid = thread_match.group(2)
+                    post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
+                else:
+                    post_url_full = post_url
+                
+                date_tag = article.css_first("time.u-dt")
+                post_date = datetime.now().strftime("%Y-%m-%d")
+                if date_tag and "datetime" in date_tag.attributes:
+                    try:
+                        post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
+                    except:
+                        pass
+                
+                matched.append({
+                    "url": post_url_full,
+                    "post_id": post_id,
+                    "matched": is_match,
+                    "post_date": post_date,
+                    "article_html": article.html
+                })
             
-            if thread_match:
-                slug = thread_match.group(1)
-                tid = thread_match.group(2)
-                post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
-            else:
-                post_url_full = post_url
-            
-            date_tag = article.css_first("time.u-dt")
-            post_date = datetime.now().strftime("%Y-%m-%d")
-            if date_tag and "datetime" in date_tag.attributes:
-                try:
-                    post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
-                except:
-                    pass
-            
-            matched.append({
-                "url": post_url_full,
-                "post_id": post_id,
-                "matched": is_match,
-                "post_date": post_date,
-                "article_html": article.html
-            })
-        
-        return [a for a in matched if a["matched"]] or matched
+            return [a for a in matched if a["matched"]] or matched
+        finally:
+            if tree:
+                del tree
+            del html_str
+            gc.collect()
 
 async def process_threads_concurrent(thread_urls, patterns):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
@@ -295,50 +320,56 @@ def extract_media_from_html(raw_html: str):
         return []
     
     html_content = html.unescape(raw_html)
-    tree = HTMLParser(html_content)
-    urls = set()
-    
-    for node in tree.css("*[src]"):
-        src = node.attributes.get("src", "").strip()
-        if src:
-            if "/vh/dli?" in src:
-                src = src.replace("/vh/dli?", "/vh/dl?")
-            urls.add(src)
-    
-    for node in tree.css("*[data-src]"):
-        ds = node.attributes.get("data-src", "").strip()
-        if ds:
-            urls.add(ds)
-    
-    for node in tree.css("*[data-video]"):
-        dv = node.attributes.get("data-video", "").strip()
-        if dv:
-            urls.add(dv)
-    
-    for node in tree.css("video, video source"):
-        src = node.attributes.get("src", "").strip()
-        if src:
-            urls.add(src)
-    
-    for node in tree.css("*[style]"):
-        style = node.attributes.get("style") or ""
-        for m in re.findall(r'url\((.*?)\)', style):
-            m = m.strip('"\' ')
-            if m:
-                urls.add(m)
-    
-    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
-        urls.add(match.strip())
-    
-    media_urls = []
-    for u in urls:
-        if u:
-            low = u.lower()
-            if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
-                full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
-                media_urls.append(full_url)
-    
-    return list(dict.fromkeys(media_urls))
+    tree = None
+    try:
+        tree = HTMLParser(html_content)
+        urls = set()
+        
+        for node in tree.css("*[src]"):
+            src = node.attributes.get("src", "").strip()
+            if src:
+                if "/vh/dli?" in src:
+                    src = src.replace("/vh/dli?", "/vh/dl?")
+                urls.add(src)
+        
+        for node in tree.css("*[data-src]"):
+            ds = node.attributes.get("data-src", "").strip()
+            if ds:
+                urls.add(ds)
+        
+        for node in tree.css("*[data-video]"):
+            dv = node.attributes.get("data-video", "").strip()
+            if dv:
+                urls.add(dv)
+        
+        for node in tree.css("video, video source"):
+            src = node.attributes.get("src", "").strip()
+            if src:
+                urls.add(src)
+        
+        for node in tree.css("*[style]"):
+            style = node.attributes.get("style") or ""
+            for m in re.findall(r'url\((.*?)\)', style):
+                m = m.strip('"\' ')
+                if m:
+                    urls.add(m)
+        
+        for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
+            urls.add(match.strip())
+        
+        media_urls = []
+        for u in urls:
+            if u:
+                low = u.lower()
+                if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
+                    full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
+                    media_urls.append(full_url)
+        
+        return list(dict.fromkeys(media_urls))
+    finally:
+        if tree:
+            del tree
+        gc.collect()
 
 def filter_media(media_list, seen_global):
     filtered = []
@@ -355,6 +386,7 @@ def filter_media(media_list, seen_global):
 async def process_articles_batch(batch_num, articles_file, media_dir):
     logger.info(f"🎬 Batch #{batch_num}: Extracting Media")
     
+    articles = None
     try:
         with open(articles_file, "r", encoding="utf-8") as f:
             articles = json.load(f)
@@ -396,6 +428,9 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
     
     logger.info(f"✓ Media extracted: {len(all_results)} posts → {media_output}")
     logger.info(f"⚠ No media: {len(no_media_posts)} posts")
+    del articles
+    del all_results
+    gc.collect()
 
 # ───────────────────────────────
 # 📄 HTML GENERATOR
@@ -843,7 +878,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     return html_content
 
 # ───────────────────────────────
-# � UPLOAD FUNCTIONS
+# 📤 UPLOAD FUNCTIONS
 # ───────────────────────────────
 async def upload_file(session: aiohttp.ClientSession, host, data):
     buf = BytesIO(data)
@@ -891,9 +926,12 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     THREADS_DIR = f"Scraping/{user_safe}/Threads"
     ARTICLES_DIR = f"Scraping/{user_safe}/Articles"
     MEDIA_DIR = f"Scraping/{user_safe}/Media"
+    USER_DATA_DIR = f"Scraping/{user_safe}"
+    user_data_file = os.path.join(USER_DATA_DIR, "user_data.json")
     
     os.makedirs(ARTICLES_DIR, exist_ok=True)
     os.makedirs(MEDIA_DIR, exist_ok=True)
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
     
     # Update progress: start
     progress = (user_idx / total_users) * 100
@@ -918,24 +956,33 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     batch_files = sorted([f for f in os.listdir(THREADS_DIR) if f.endswith(".json")])
     
     for idx, batch_file in enumerate(batch_files, 1):
-        with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
-            threads_data = json.load(f)
+        threads_data = None
+        results = None
+        try:
+            with open(os.path.join(THREADS_DIR, batch_file), "r", encoding="utf-8") as f:
+                threads_data = json.load(f)
 
-        all_threads = []
-        for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
-            all_threads.extend(threads_data[page_key])
+            all_threads = []
+            for page_key in sorted(threads_data.keys(), key=lambda x: int(x.split("_")[1])):
+                all_threads.extend(threads_data[page_key])
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-        async with aiohttp.ClientSession() as client:
-            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
-            results = await asyncio.gather(*tasks)
-        
-        all_articles = [item for sublist in results for item in sublist]
-        articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
-        with open(articles_output, "w", encoding="utf-8") as f:
-            json.dump(all_articles, f, indent=2, ensure_ascii=False)
-        
-        await process_articles_batch(idx, articles_output, MEDIA_DIR)
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+            async with aiohttp.ClientSession() as client:
+                tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+                results = await asyncio.gather(*tasks)
+            
+            all_articles = [item for sublist in results for item in sublist]
+            articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
+            with open(articles_output, "w", encoding="utf-8") as f:
+                json.dump(all_articles, f, indent=2, ensure_ascii=False)
+            
+            await process_articles_batch(idx, articles_output, MEDIA_DIR)
+        finally:
+            if threads_data:
+                del threads_data
+            if results:
+                del results
+            gc.collect()
     
     # Update progress
     progress += 30 / total_users
@@ -949,11 +996,17 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     media_files = sorted([f for f in os.listdir(MEDIA_DIR) if f.startswith("batch_") and f.endswith("_desifakes_media.json")])
     user_data = []
     for mf in media_files:
-        with open(os.path.join(MEDIA_DIR, mf), "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for entry in data:
+        media_data = None
+        try:
+            with open(os.path.join(MEDIA_DIR, mf), "r", encoding="utf-8") as f:
+                media_data = json.load(f)
+            for entry in media_data:
                 entry["username"] = user
                 user_data.append(entry)
+        finally:
+            if media_data:
+                del media_data
+            gc.collect()
     
     # Deduplicate for individual
     seen_urls = set()
@@ -965,30 +1018,40 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                 new_media.append(url)
         entry["media"] = new_media
     
+    # Save user_data to file instead of returning list
+    with open(user_data_file, "w", encoding="utf-8") as f:
+        json.dump(user_data, f, indent=2, ensure_ascii=False)
+    del user_data
+    gc.collect()
+    
     # Generate individual HTML
     os.makedirs(HTML_DIR, exist_ok=True)
     individual_output = os.path.join(HTML_DIR, f"{user_idx+1:02d}_{user_safe}.html")
     
     media_by_date = {"images": {}, "videos": {}, "gifs": {}}
-    for entry in user_data:
-        date = entry.get("post_date", "")
-        if not date:
-            continue
-        for url in entry.get("media", []):
-            if 'vh/dl?url' in url:
-                typ = 'videos'
-            elif 'vh/dli?' in url:
-                typ = 'images'
-            else:
-                if '.mp4' in url.lower():
+    with open(user_data_file, "r", encoding="utf-8") as f:
+        user_data_loaded = json.load(f)
+        for entry in user_data_loaded:
+            date = entry.get("post_date", "")
+            if not date:
+                continue
+            for url in entry.get("media", []):
+                if 'vh/dl?url' in url:
                     typ = 'videos'
-                elif '.gif' in url.lower():
-                    typ = 'gifs'
-                else:
+                elif 'vh/dli?' in url:
                     typ = 'images'
-            if date not in media_by_date[typ]:
-                media_by_date[typ][date] = []
-            media_by_date[typ][date].append(url)
+                else:
+                    if '.mp4' in url.lower():
+                        typ = 'videos'
+                    elif '.gif' in url.lower():
+                        typ = 'gifs'
+                    else:
+                        typ = 'images'
+                if date not in media_by_date[typ]:
+                    media_by_date[typ][date] = []
+                media_by_date[typ][date].append(url)
+        del user_data_loaded
+        gc.collect()
     
     media_by_date_per_username = {user: media_by_date}
     html_content = create_html(media_by_date_per_username, [user], 2019, 2025)
@@ -1013,7 +1076,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
     except:
         pass
     
-    return user_data
+    return user_data_file
 
 # ───────────────────────────────
 # BOT HANDLER
@@ -1034,15 +1097,16 @@ async def handle_message(client: Client, message: Message):
         return
     
     total_users = len(usernames)
-    all_data = []
+    all_data_files = []
     last_edit = [0]
     
     # Send initial progress message
     progress_msg = await message.reply("Starting processing...")
     
     for user_idx, user in enumerate(usernames):
-        user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
-        all_data.extend(user_data)
+        user_data_file = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+        all_data_files.append(user_data_file)
+        gc.collect()
     
     # Final progress
     progress = 100
@@ -1053,29 +1117,35 @@ async def handle_message(client: Client, message: Message):
     media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
     
     seen_urls = set()
-    for entry in all_data:
-        user = entry["username"]
-        date = entry.get("post_date", "")
-        if not date:
-            continue
-        for url in entry.get("media", []):
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            if 'vh/dl?url' in url:
-                typ = 'videos'
-            elif 'vh/dli?' in url:
-                typ = 'images'
-            else:
-                if '.mp4' in url.lower():
-                    typ = 'videos'
-                elif '.gif' in url.lower():
-                    typ = 'gifs'
-                else:
-                    typ = 'images'
-            if date not in media_by_date_per_username[user][typ]:
-                media_by_date_per_username[user][typ][date] = []
-            media_by_date_per_username[user][typ][date].append(url)
+    for user_data_file in all_data_files:
+        with open(user_data_file, "r", encoding="utf-8") as f:
+            all_data = json.load(f)
+            for entry in all_data:
+                user = entry["username"]
+                date = entry.get("post_date", "")
+                if not date:
+                    continue
+                for url in entry.get("media", []):
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    if 'vh/dl?url' in url:
+                        typ = 'videos'
+                    elif 'vh/dli?' in url:
+                        typ = 'images'
+                    else:
+                        if '.mp4' in url.lower():
+                            typ = 'videos'
+                        elif '.gif' in url.lower():
+                            typ = 'gifs'
+                        else:
+                            typ = 'images'
+                    if date not in media_by_date_per_username[user][typ]:
+                        media_by_date_per_username[user][typ][date] = []
+                    media_by_date_per_username[user][typ][date].append(url)
+            del all_data
+            gc.collect()
+        os.remove(user_data_file)
     
     html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
     
