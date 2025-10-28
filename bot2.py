@@ -17,9 +17,14 @@ from pyrogram import Client, filters
 from pyrogram.types import Update, Message
 from flask import Flask
 import threading
+import sys
+import aiofiles
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Pre-compiled regex patterns for performance
+COMPILED_URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
+COMPILED_STYLE_URL_PATTERN = re.compile(r'url\((.*?)\)', re.IGNORECASE)
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Health check app
@@ -118,8 +123,10 @@ def get_total_pages(html_str: str):
     tree = HTMLParser(html_str)
     nav = tree.css_first("ul.pageNav-main")
     if not nav:
+        del tree
         return 1
     pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
+    del tree
     return max(pages) if pages else 1
 
 def extract_threads(html_str: str):
@@ -131,6 +138,7 @@ def extract_threads(html_str: str):
             full_link = urljoin(BASE_URL, href)
             if full_link not in threads:
                 threads.append(full_link)
+    del tree
     return threads
 
 # ───────────────────────────────
@@ -174,30 +182,29 @@ async def process_batch(client, batch_num, start_url, query, title_only):
         logger.info(f"→ Older results found!")
     return batch_data, next_batch_url
 
-async def collect_threads(query, title_only, threads_dir):
+async def collect_threads(query, title_only, threads_dir, client):
     os.makedirs(threads_dir, exist_ok=True)
     start_url = build_search_url(INITIAL_SEARCH_ID, query, NEWER_THAN, OLDER_THAN, title_only=title_only)
     batch_num = 1
     current_url = start_url
     
-    async with httpx.AsyncClient() as client:
-        while current_url:
-            batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
-            if not batch_data:
-                break
-            
-            file_name = os.path.join(threads_dir, f"batch_{batch_num:02d}_desifakes_threads.json")
-            with open(file_name, "w", encoding="utf-8") as f:
-                json.dump(batch_data, f, indent=2, ensure_ascii=False)
-            
-            total = sum(len(v) for v in batch_data.values())
-            logger.info(f"✓ Batch #{batch_num}: {total} threads → {file_name}")
-            
-            if not next_url:
-                logger.info("✓ All threads collected")
-                break
-            current_url = next_url
-            batch_num += 1
+    while current_url:
+        batch_data, next_url = await process_batch(client, batch_num, current_url, query, title_only)
+        if not batch_data:
+            break
+        
+        file_name = os.path.join(threads_dir, f"batch_{batch_num:02d}_desifakes_threads.json")
+        with open(file_name, "w", encoding="utf-8") as f:
+            json.dump(batch_data, f, indent=2, ensure_ascii=False)
+        
+        total = sum(len(v) for v in batch_data.values())
+        logger.info(f"✓ Batch #{batch_num}: {total} threads → {file_name}")
+        
+        if not next_url:
+            logger.info("✓ All threads collected")
+            break
+        current_url = next_url
+        batch_num += 1
 
 # ───────────────────────────────
 # 📺 ARTICLE COLLECTOR
@@ -277,12 +284,26 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
         
         return [a for a in matched if a["matched"]] or matched
 
-async def process_threads_concurrent(thread_urls, patterns):
+async def process_threads_concurrent(thread_urls, patterns, client):
+    """Process threads in batches to avoid memory spike from processing all at once"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    async with httpx.AsyncClient() as client:
-        tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
-        results = await asyncio.gather(*tasks)
-    return [item for sublist in results for item in sublist]
+    batch_size = 50  # Process 50 URLs at a time
+    all_results = []
+
+    for i in range(0, len(thread_urls), batch_size):
+        batch = thread_urls[i:i + batch_size]
+        tasks = [process_thread(client, url, patterns, semaphore) for url in batch]
+        batch_results = await asyncio.gather(*tasks)
+        all_results.extend([item for sublist in batch_results for item in sublist])
+
+        # Force garbage collection between batches
+        del batch, batch_results, tasks
+        gc.collect()
+
+        logger.info(f"Processed {min(i + batch_size, len(thread_urls))}/{len(thread_urls)} threads")
+        await asyncio.sleep(0.1)  # Small delay to allow cleanup
+
+    return all_results
 
 # ───────────────────────────────
 # 🎬 MEDIA EXTRACTION
@@ -319,12 +340,12 @@ def extract_media_from_html(raw_html: str):
     
     for node in tree.css("*[style]"):
         style = node.attributes.get("style") or ""
-        for m in re.findall(r'url\((.*?)\)', style):
+        for m in COMPILED_STYLE_URL_PATTERN.findall(style):
             m = m.strip('"\' ')
             if m:
                 urls.add(m)
     
-    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
+    for match in COMPILED_URL_PATTERN.findall(html_content):
         urls.add(match.strip())
     
     media_urls = []
@@ -335,6 +356,7 @@ def extract_media_from_html(raw_html: str):
                 full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
                 media_urls.append(full_url)
     
+    del tree
     return list(dict.fromkeys(media_urls))
 
 def filter_media(media_list, seen_global):
@@ -399,10 +421,7 @@ async def process_articles_batch(batch_num, articles_file, media_dir):
 # ───────────────────────────────
 # 📄 HTML GENERATOR
 # ───────────────────────────────
-# ───────────────────────────────
-# 📄 HTML GENERATOR
-# ───────────────────────────────
-def create_html_streaming(file_path, media_by_date_per_username, usernames, start_year, end_year):
+async def create_html_streaming(file_path, media_by_date_per_username, usernames, start_year, end_year):
     usernames_str = ", ".join(usernames)
     title = f"{usernames_str} - Media Gallery"
     logger.info(f"Generating HTML for usernames: {usernames_str}")
@@ -469,9 +488,9 @@ def create_html_streaming(file_path, media_by_date_per_username, usernames, star
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
-    with open(file_path, 'w', encoding='utf-8') as f:
+    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
         # Write HTML in chunks to avoid large strings in memory
-        f.write(f"""<!DOCTYPE html>
+        await f.write(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -534,23 +553,23 @@ def create_html_streaming(file_path, media_by_date_per_username, usernames, star
         
         # Write filter buttons
         for username in usernames:
-            f.write(f"""    <button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" 
+            await f.write(f"""    <button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" 
     data-original-text="{html.escape(username)} ({media_counts[username]})">
     {html.escape(username)} ({media_counts[username]})</button>
 """)
         
-        f.write("""  </div>
+        await f.write("""  </div>
   <div class="pagination" id="pagination"></div>
   <div class="masonry" id="masonry"></div>
   <script>
 """)
         
         # Write script variables
-        f.write("    const mediaData = ")
-        f.write(media_data_json)
-        f.write(";\n")
-        f.write(f"    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};\n")
-        f.write("""    const masonry = document.getElementById("masonry");
+        await f.write("    const mediaData = ")
+        await f.write(media_data_json)
+        await f.write(";\n")
+        await f.write(f"    const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};\n")
+        await f.write("""    const masonry = document.getElementById("masonry");
     const pagination = document.getElementById("pagination");
     const buttons = document.querySelectorAll('.filter-button');
     const mediaTypeSelect = document.getElementById('mediaType');
@@ -709,8 +728,8 @@ def create_html_streaming(file_path, media_by_date_per_username, usernames, star
         const mediaType = mediaTypeSelect.value;
         const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
         const itemsPerPage = parseInt(itemsPerPageInput.value) || """)
-        f.write(str(default_items_per_page))
-        f.write(""";
+        await f.write(str(default_items_per_page))
+        await f.write(""";
         const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
         const allMedia = result.media;
         const totalItems = result.total;
@@ -861,7 +880,7 @@ def create_html_streaming(file_path, media_by_date_per_username, usernames, star
 # ───────────────────────────────
 async def upload_file(client, host, file_path):
     with open(file_path, 'rb') as f:
-        files = {host["field"]:(file_path, f, "text/html")}
+        files = {host["field"]:(os.path.basename(file_path), f, "text/html")}
         try:
             r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
             if r.status_code in (200,201):
@@ -893,7 +912,7 @@ def generate_bar(percentage):
 # ───────────────────────────────
 # PROCESS USER
 # ───────────────────────────────
-async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
+async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, client):
     logger.info(f"🔍 Processing user: {user}")
     
     search_display = "+".join(user.split())
@@ -923,7 +942,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         last_edit[0] = now
     
     # Phase 1: Collect threads
-    await collect_threads(search_display, title_only, THREADS_DIR)
+    await collect_threads(search_display, title_only, THREADS_DIR, client)
     
     # Update progress
     progress += 20 / total_users
@@ -948,9 +967,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         del threads_data
         
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-        async with httpx.AsyncClient() as client:
-            tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
-            results = await asyncio.gather(*tasks)
+        tasks = [process_thread(client, url, PATTERNS, semaphore) for url in all_threads]
+        results = await asyncio.gather(*tasks)
         
         all_articles = [item for sublist in results for item in sublist]
         articles_output = os.path.join(ARTICLES_DIR, f"batch_{idx:02d}_desifakes_articles.json")
@@ -1017,7 +1035,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
             media_by_date[typ][date].append(url)
     
     media_by_date_per_username = {user: media_by_date}
-    success = create_html_streaming(individual_output, media_by_date_per_username, [user], 2019, 2025)
+    success = await create_html_streaming(individual_output, media_by_date_per_username, [user], 2019, 2025)
     
     if success:
         pass
@@ -1066,97 +1084,102 @@ async def handle_message(client: Client, message: Message):
     # Send initial progress message
     progress_msg = await message.reply("Starting processing...")
     
-    for user_idx, user in enumerate(usernames):
-        user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
-        temp_file = f"temp_user_{user_idx}.json"
-        with open(temp_file, 'w') as f:
-            json.dump(user_data, f)
-        temp_files.append(temp_file)
-        del user_data
-        gc.collect()
+    # Create shared httpx client
+    httpx_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=10, max_keepalive_connections=5), timeout=TIMEOUT)
     
-    # Final progress
-    progress = 100
-    bar = generate_bar(progress)
-    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
-    await progress_msg.edit(msg)
-    
-    # Generate final
-    media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
-    
-    seen_urls = set()
-    for temp_file in temp_files:
-        with open(temp_file, 'r') as f:
-            user_data = json.load(f)
-        for entry in user_data:
-            user = entry["username"]
-            date = entry.get("post_date", "")
-            if not date:
-                continue
-            for url in entry.get("media", []):
-                if url in seen_urls:
+    try:
+        for user_idx, user in enumerate(usernames):
+            user_data = await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, httpx_client)
+            temp_file = f"temp_user_{user_idx}.json"
+            with open(temp_file, 'w') as f:
+                json.dump(user_data, f)
+            temp_files.append(temp_file)
+            del user_data
+            gc.collect()
+        
+        # Final progress
+        progress = 100
+        bar = generate_bar(progress)
+        msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating final gallery..."
+        await progress_msg.edit(msg)
+        
+        # Generate final
+        media_by_date_per_username = {u: {"images": {}, "videos": {}, "gifs": {}} for u in usernames}
+        
+        seen_urls = set()
+        for temp_file in temp_files:
+            with open(temp_file, 'r') as f:
+                user_data = json.load(f)
+            for entry in user_data:
+                user = entry["username"]
+                date = entry.get("post_date", "")
+                if not date:
                     continue
-                seen_urls.add(url)
-                if 'vh/dl?url' in url:
-                    typ = 'videos'
-                elif 'vh/dli?' in url:
-                    typ = 'images'
-                else:
-                    if '.mp4' in url.lower():
+                for url in entry.get("media", []):
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    if 'vh/dl?url' in url:
                         typ = 'videos'
-                    elif '.gif' in url.lower():
-                        typ = 'gifs'
-                    else:
+                    elif 'vh/dli?' in url:
                         typ = 'images'
-                if date not in media_by_date_per_username[user][typ]:
-                    media_by_date_per_username[user][typ][date] = []
-                media_by_date_per_username[user][typ][date].append(url)
-        del user_data
+                    else:
+                        if '.mp4' in url.lower():
+                            typ = 'videos'
+                        elif '.gif' in url.lower():
+                            typ = 'gifs'
+                        else:
+                            typ = 'images'
+                    if date not in media_by_date_per_username[user][typ]:
+                        media_by_date_per_username[user][typ][date] = []
+                    media_by_date_per_username[user][typ][date].append(url)
+            del user_data
+            gc.collect()
+        
+        success = await create_html_streaming(OUTPUT_FILE, media_by_date_per_username, usernames, 2019, 2025)
+        
+        total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
+        
         gc.collect()
-    
-    success = create_html_streaming(OUTPUT_FILE, media_by_date_per_username, usernames, 2019, 2025)
-    
-    total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
-    
-    gc.collect()
-    
-    if success:
-        # Upload
-        async with httpx.AsyncClient() as client:
-            tasks = [upload_file(client, h, OUTPUT_FILE) for h in HOSTS]
+        
+        if success:
+            # Upload
+            tasks = [upload_file(httpx_client, h, OUTPUT_FILE) for h in HOSTS]
             results = await asyncio.gather(*tasks)
+            
+            links = []
+            for name, res in results:
+                status = "✅" if res.startswith("https://") else "❌"
+                links.append(f"{status} {name}: {res}")
+            
+            caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
+            
+            await message.reply_document(OUTPUT_FILE, caption=caption)
+            
+            # Delete progress message after sending the final gallery
+            await progress_msg.delete()
+            
+            # Clean up
+            try:
+                for item in os.listdir("Scraping"):
+                    path = os.path.join("Scraping", item)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    elif os.path.isfile(path) and path.endswith(".json"):
+                        os.remove(path)
+            except:
+                pass
+        else:
+            await message.reply("Failed to generate HTML")
         
-        links = []
-        for name, res in results:
-            status = "✅" if res.startswith("https://") else "❌"
-            links.append(f"{status} {name}: {res}")
-        
-        caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
-        
-        await message.reply_document(OUTPUT_FILE, caption=caption)
-        
-        # Delete progress message after sending the final gallery
-        await progress_msg.delete()
-        
-        # Clean up
-        try:
-            for item in os.listdir("Scraping"):
-                path = os.path.join("Scraping", item)
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                elif os.path.isfile(path) and path.endswith(".json"):
-                    os.remove(path)
-        except:
-            pass
-    else:
-        await message.reply("Failed to generate HTML")
-    
-    # Clean up temp files
-    for temp_file in temp_files:
-        try:
-            os.remove(temp_file)
-        except:
-            pass
+        # Clean up temp files
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+    finally:
+        await httpx_client.aclose()
 
 # ───────────────────────────────
 # MAIN
