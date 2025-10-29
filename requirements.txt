@@ -10,3 +10,4 @@ httpx
 rich
 aiofiles
 aiosqlite
+psutil
