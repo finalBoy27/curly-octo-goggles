@@ -24,12 +24,16 @@ import aiosqlite
 # Health check app
 app = FastAPI()
 
+@app.get('/')
+def root():
+    return {"status": "OK"}
+
 @app.get('/health')
 def health():
     return {"status": "OK"}
 
 def run_fastapi():
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 8081)))
+    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
 # Disable FastAPI logs if needed, but for now keep
 # logging.getLogger('uvicorn').disabled = True  # optional
