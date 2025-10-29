@@ -9,3 +9,4 @@ flask
 httpx
 rich
 aiofiles
+aiosqlite
