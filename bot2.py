@@ -8,7 +8,7 @@ import html
 import math
 import gc
 import logging
-import shutil
+import aioshutil
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
@@ -16,21 +16,25 @@ from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message
-from flask import Flask
+from fastapi import FastAPI
+import uvicorn
 import threading
 import aiosqlite
 
 # Health check app
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route('/health')
+@app.get('/health')
 def health():
-    return 'OK'
+    return {"status": "OK"}
 
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
+def run_fastapi():
+    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 8081)))
 
-threading.Thread(target=run_flask, daemon=True).start()
+# Disable FastAPI logs if needed, but for now keep
+# logging.getLogger('uvicorn').disabled = True  # optional
+
+threading.Thread(target=run_fastapi, daemon=True).start()
 
 # ───────────────────────────────
 # ⚙️ CONFIG
@@ -42,9 +46,8 @@ NEWER_THAN = "2019"
 OLDER_THAN = "2025"
 TIMEOUT = 10.0
 DELAY_BETWEEN_REQUESTS = 0.25
-TEMP_MEDIA_FILE = "Scraping/tempMedia.json"
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 25  # Reduced for memory
+MAX_CONCURRENT_WORKERS = 20  # Reduced for memory
 MAX_RETRIES = 4
 RETRY_DELAY = 2
 
@@ -884,6 +887,10 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                 current_url = next_url
                 batch_num += 1
     
+    # Clean up after processing user
+    gc.collect()
+    log_memory()
+    
     # Update progress
     progress += 100 / total_users
     bar = generate_bar(progress)
@@ -946,10 +953,20 @@ async def handle_message(client: Client, message: Message):
             media_by_date_per_username[user][typ][date] = []
         media_by_date_per_username[user][typ][date].append(url)
     
+    # Clean up rows to free memory
+    del rows
+    gc.collect()
+    log_memory()
+    
     # Generate HTML
     html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
     
     total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
+    
+    # Clean up media_by_date_per_username to free memory
+    del media_by_date_per_username
+    gc.collect()
+    log_memory()
     
     if html_content:
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -977,8 +994,8 @@ async def handle_message(client: Client, message: Message):
         # Clean up
         try:
             if os.path.exists(TEMP_DB):
-                os.remove(TEMP_DB)
-            shutil.rmtree("Scraping")
+                await asyncio.to_thread(os.remove, TEMP_DB)
+            await aioshutil.rmtree("Scraping")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
     else:
@@ -988,5 +1005,5 @@ async def handle_message(client: Client, message: Message):
 # MAIN
 # ───────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
