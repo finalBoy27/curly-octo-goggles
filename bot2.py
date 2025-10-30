@@ -48,12 +48,12 @@ INITIAL_SEARCH_ID = "46509052"
 ORDER = "date"
 NEWER_THAN = "2019"
 OLDER_THAN = "2025"
-TIMEOUT = 10.0
-DELAY_BETWEEN_REQUESTS = 0.25
+TIMEOUT = [5.0, 10.0, 15.0]
+DELAY_BETWEEN_REQUESTS = 0.3
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 20  # Reduced for memory
-MAX_RETRIES = 4
-RETRY_DELAY = 2
+MAX_CONCURRENT_WORKERS = 8  # Reduced for memory
+MAX_RETRIES = 3
+RETRY_DELAY = [1.0, 1.5, 2.0]
 
 VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
 EXCLUDE_PATTERNS = ["/data/avatars/", "/data/assets/", "/data/addonflare/"]
@@ -150,12 +150,17 @@ def extract_threads(html_str: str):
 # 🌐 FETCH
 # ───────────────────────────────
 async def fetch_page(client, url: str):
-    try:
-        r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
-        return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
-    except Exception as e:
-        logger.error(f"Fetch error for {url}: {e}")
-        return {"ok": False, "html": "", "final_url": url}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
+            return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
+        except Exception as e:
+            logger.error(f"Fetch attempt {attempt} failed for {url}: {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
+            else:
+                logger.error(f"All retries failed for {url}")
+                return {"ok": False, "html": "", "final_url": url}
 
 # ───────────────────────────────
 # 📦 ARTICLE PROCESSOR WITH RETRIES
@@ -163,13 +168,13 @@ async def fetch_page(client, url: str):
 async def make_request(client: httpx.AsyncClient, url: str, retries=MAX_RETRIES) -> str:
     for attempt in range(1, retries + 1):
         try:
-            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
+            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
             resp.raise_for_status()
             return resp.text
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed for {url}: {e}")
             if attempt < retries:
-                await asyncio.sleep(RETRY_DELAY)
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
             else:
                 logger.error(f"All retries failed for {url}")
                 return ""
@@ -374,6 +379,16 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
         return None
 
+    # Compute year counts
+    year_counts = {}
+    for username, media_list in media_data.items():
+        for item in media_list:
+            year = item['date'].split('-')[0]
+            if year not in year_counts:
+                year_counts[year] = 0
+            year_counts[year] += 1
+    year_counts_json = json.dumps(year_counts)
+
     # Calculate default itemsPerPage
     default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
 
@@ -431,6 +446,9 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       <option value="videos">Videos ({total_type_counts['videos']})</option>
       <option value="gifs">Gifs ({total_type_counts['gifs']})</option>
     </select>
+    <select id="yearSelect" class="media-type-select">
+      <option value="all" selected>All ({total_items})</option>
+    </select>
     <div id="itemsPerUserContainer">
       <input type="number" id="itemsPerUser" class="number-input" min="1" value="2" placeholder="Items per user">
     </div>
@@ -447,10 +465,20 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
   <script>
     const mediaData = {media_data_json};
     const usernames = {json.dumps([username.replace(' ', '_') for username in usernames])};
+    const yearCounts = {year_counts_json};
     const masonry = document.getElementById("masonry");
     const pagination = document.getElementById("pagination");
     const buttons = document.querySelectorAll('.filter-button');
     const mediaTypeSelect = document.getElementById('mediaType');
+    const yearSelect = document.getElementById('yearSelect');
+    yearSelect.innerHTML = '<option value="all" selected>All (' + Object.values(yearCounts).reduce((a,b)=>a+b,0) + ')</option>';
+    const sortedYears = Object.keys(yearCounts).sort((a,b)=>b-a);
+    sortedYears.forEach(year => {{
+      const option = document.createElement('option');
+      option.value = year;
+      option.textContent = year + ' (' + yearCounts[year] + ')';
+      yearSelect.appendChild(option);
+    }});
     const itemsPerUserInput = document.getElementById('itemsPerUser');
     const itemsPerPageInput = document.getElementById('itemsPerPage');
     let selectedUsername = '';
@@ -498,7 +526,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       }}, {{ once: true }});
     }}
 
-    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page) {{
+    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page, yearFilter) {{
       try {{
         let allMedia = [];
         if (selectedUsername === '') {{
@@ -508,6 +536,9 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
             let userMedia = mediaData[username] || [];
             if (mediaType !== 'all') {{
               userMedia = userMedia.filter(item => item.type === mediaType);
+            }}
+            if (yearFilter !== 'all') {{
+              userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
             }}
             userMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
             mediaByUser[username] = userMedia;
@@ -526,11 +557,14 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
           if (mediaType !== 'all') {{
             userMedia = userMedia.filter(item => item.type === mediaType);
           }}
+          if (yearFilter !== 'all') {{
+            userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
+          }}
           allMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
         }}
         const start = (page - 1) * itemsPerPage;
         const end = start + itemsPerPage;
-        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, start, end, total: allMedia.length }});
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, yearFilter, start, end, total: allMedia.length }});
         return {{ media: allMedia.slice(start, end), total: allMedia.length }};
       }} catch (e) {{
         console.error('Error in getOrderedMedia:', e);
@@ -604,12 +638,13 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
       try {{
         masonry.innerHTML = '';
         const mediaType = mediaTypeSelect.value;
+        const yearFilter = yearSelect.value;
         const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
         const itemsPerPage = parseInt(itemsPerPageInput.value) || {default_items_per_page};
-        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage);
+        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage, yearFilter);
         const allMedia = result.media;
         const totalItems = result.total;
-        console.log('renderMedia:', {{ mediaType, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
+        console.log('renderMedia:', {{ mediaType, yearFilter, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
         updatePagination(totalItems, itemsPerPage, window.currentPage);
 
         const columnsCount = 3;
@@ -691,6 +726,16 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         renderMedia();
       }} catch (e) {{
         console.error('Error in mediaTypeSelect change handler:', e);
+      }}
+    }});
+
+    yearSelect.addEventListener('change', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Year changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in yearSelect change handler:', e);
       }}
     }});
 
