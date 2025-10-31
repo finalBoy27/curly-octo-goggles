@@ -78,6 +78,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7380785361:AAHjr8lNFKghQNCJl5BlWJ2c-AI3F_uiA
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+ALLOWED_CHAT_IDS = {5809601894, 1285451259}
+
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
 # ───────────────────────────────
@@ -956,6 +958,9 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
 # ───────────────────────────────
 @bot.on_message(filters.text & filters.private)
 async def handle_message(client: Client, message: Message):
+    if message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+
     text = message.text.strip()
     match = re.match(r"(.+?)\s+(\d)$", text)
     if not match:
