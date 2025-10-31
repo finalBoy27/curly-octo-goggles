@@ -46,7 +46,7 @@ threading.Thread(target=run_fastapi, daemon=True).start()
 BASE_URL = "https://desifakes.com"
 INITIAL_SEARCH_ID = "46509052"
 ORDER = "date"
-NEWER_THAN = "2019"
+NEWER_THAN = "2024"
 OLDER_THAN = "2025"
 TIMEOUT = [5.0, 10.0, 15.0]
 DELAY_BETWEEN_REQUESTS = 0.3
