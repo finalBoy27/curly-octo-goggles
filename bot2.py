@@ -104,10 +104,10 @@ def extract_search_id(url: str):
 def build_search_url(search_id, query, newer_than, older_than, page=None, older_than_ts=None, title_only=0):
     base_url = f"{BASE_URL}/search/{search_id}/"
     params = {"q": query, "o": ORDER}
+    params["c[newer_than]"] = f"{newer_than}-01-01"
     if older_than_ts:
         params["c[older_than]"] = older_than_ts
     else:
-        params["c[newer_than]"] = f"{newer_than}-01-01"
         params["c[older_than]"] = f"{older_than}-12-31"
     if title_only == 1:
         params["c[title_only]"] = 1
