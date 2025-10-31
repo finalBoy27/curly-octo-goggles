@@ -126,8 +126,8 @@ def find_view_older_link(html_str: str, title_only: int = 0):
         return None
     sid, before, q = match.groups()
     if title_only == 1:
-        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
-    return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={NEWER_THAN}-01-01&c[older_than]={before}&o=date&c[title_only]=1"
+    return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={NEWER_THAN}-01-01&c[older_than]={before}&o=date"
 
 def get_total_pages(html_str: str):
     tree = HTMLParser(html_str)
