@@ -11,3 +11,4 @@ regex
 loguru
 fastapi
 uvicorn
+aiohttp
