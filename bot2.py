@@ -1,5 +1,5 @@
 import asyncio
-import httpx
+import aiohttp
 import re
 import os
 import json
@@ -46,12 +46,14 @@ threading.Thread(target=run_fastapi, daemon=True).start()
 BASE_URL = "https://desifakes.com"
 INITIAL_SEARCH_ID = "46509052"
 ORDER = "date"
-NEWER_THAN = "2024"
-OLDER_THAN = "2025"
-TIMEOUT = [5.0, 10.0, 15.0]
-DELAY_BETWEEN_REQUESTS = 0.3
+# Default values - can be overridden by user input
+DEFAULT_NEWER_THAN = "2024"
+DEFAULT_OLDER_THAN = "2025"
+DEFAULT_MAX_CONCURRENT_WORKERS = 8
+# Optimized timeouts for aiohttp
+TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
+DELAY_BETWEEN_REQUESTS = 0.2  # Reduced for better throughput
 TEMP_DB = "Scraping/tempMedia.db"
-MAX_CONCURRENT_WORKERS = 8  # Reduced for memory
 MAX_RETRIES = 3
 RETRY_DELAY = [1.0, 1.5, 2.0]
 
@@ -115,7 +117,7 @@ def build_search_url(search_id, query, newer_than, older_than, page=None, older_
         params["page"] = page
     return f"{base_url}?{urlencode(params)}"
 
-def find_view_older_link(html_str: str, title_only: int = 0):
+def find_view_older_link(html_str: str, newer_than: str, title_only: int = 0):
     tree = HTMLParser(html_str)
     link_node = tree.css_first("div.block-footer a")
     if not link_node or not link_node.attributes.get("href"):
@@ -126,8 +128,8 @@ def find_view_older_link(html_str: str, title_only: int = 0):
         return None
     sid, before, q = match.groups()
     if title_only == 1:
-        return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={NEWER_THAN}-01-01&c[older_than]={before}&o=date&c[title_only]=1"
-    return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={NEWER_THAN}-01-01&c[older_than]={before}&o=date"
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={newer_than}-01-01&c[older_than]={before}&o=date&c[title_only]=1"
+    return f"{BASE_URL}/search/{sid}/?q={q}&c[newer_than]={newer_than}-01-01&c[older_than]={before}&o=date"
 
 def get_total_pages(html_str: str):
     tree = HTMLParser(html_str)
@@ -151,11 +153,12 @@ def extract_threads(html_str: str):
 # ───────────────────────────────
 # 🌐 FETCH
 # ───────────────────────────────
-async def fetch_page(client, url: str):
+async def fetch_page(session, url: str):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
-            return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
+            async with session.get(url, allow_redirects=True, timeout=TIMEOUT) as r:
+                text = await r.text()
+                return {"ok": r.status == 200, "html": text, "final_url": str(r.url)}
         except Exception as e:
             logger.error(f"Fetch attempt {attempt} failed for {url}: {e}")
             if attempt < MAX_RETRIES:
@@ -167,12 +170,12 @@ async def fetch_page(client, url: str):
 # ───────────────────────────────
 # 📦 ARTICLE PROCESSOR WITH RETRIES
 # ───────────────────────────────
-async def make_request(client: httpx.AsyncClient, url: str, retries=MAX_RETRIES) -> str:
+async def make_request(session: aiohttp.ClientSession, url: str, retries=MAX_RETRIES) -> str:
     for attempt in range(1, retries + 1):
         try:
-            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
-            resp.raise_for_status()
-            return resp.text
+            async with session.get(url, allow_redirects=True, timeout=TIMEOUT) as resp:
+                resp.raise_for_status()
+                return await resp.text()
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed for {url}: {e}")
             if attempt < retries:
@@ -201,9 +204,9 @@ def article_matches_patterns(article, patterns):
             pass
     return False
 
-async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphore):
+async def process_thread(session: aiohttp.ClientSession, post_url, patterns, semaphore):
     async with semaphore:
-        html_str = await make_request(client, post_url)
+        html_str = await make_request(session, post_url)
         if not html_str:
             return []
         
@@ -244,10 +247,17 @@ async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphor
         
         return [a for a in matched if a["matched"]] or matched
 
-async def process_threads_concurrent(thread_urls, patterns):
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    async with httpx.AsyncClient() as client:
-        tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
+async def process_threads_concurrent(thread_urls, patterns, max_workers):
+    semaphore = asyncio.Semaphore(max_workers)
+    # Optimized connector settings for aiohttp
+    connector = aiohttp.TCPConnector(
+        limit=max_workers * 2,
+        limit_per_host=max_workers,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [process_thread(session, url, patterns, semaphore) for url in thread_urls]
         results = await asyncio.gather(*tasks)
     return [item for sublist in results for item in sublist]
 
@@ -802,28 +812,36 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     return html_content
 
 # ───────────────────────────────
-# � UPLOAD FUNCTIONS
+# 📤 UPLOAD FUNCTIONS
 # ───────────────────────────────
-async def upload_file(client, host, data):
+async def upload_file(session, host, data):
     buf = BytesIO(data)
-    files = {host["field"]:(UPLOAD_FILE, buf, "text/html")}
+    form_data = aiohttp.FormData()
+    form_data.add_field(host["field"], buf, filename=UPLOAD_FILE, content_type="text/html")
+    
+    # Add additional data fields if any
+    if host.get("data"):
+        for key, value in host["data"].items():
+            form_data.add_field(key, value)
+    
     try:
-        r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
-        if r.status_code in (200,201):
-            if host["name"]=="HTML Hosting":
-                j = r.json()
-                if j.get("success") and j.get("url"):
-                    return (host["name"], j["url"])
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        async with session.post(host["url"], data=form_data, timeout=timeout) as r:
+            if r.status in (200, 201):
+                if host["name"] == "HTML Hosting":
+                    j = await r.json()
+                    if j.get("success") and j.get("url"):
+                        return (host["name"], j["url"])
+                    else:
+                        return (host["name"], f"Error: {j.get('error','Unknown')}")
                 else:
-                    return (host["name"], f"Error: {j.get('error','Unknown')}")
-            else:
-                t = r.text.strip()
-                if t.startswith("https://"):
-                    if host["name"]=="Litterbox" and "files.catbox.moe" in t:
-                        t = "https://litterbox.catbox.moe/"+t.split("/")[-1]
-                    return (host["name"], t)
-                return (host["name"], f"Invalid response: {t[:100]}")
-        return (host["name"], f"HTTP {r.status_code}")
+                    t = (await r.text()).strip()
+                    if t.startswith("https://"):
+                        if host["name"] == "Litterbox" and "files.catbox.moe" in t:
+                            t = "https://litterbox.catbox.moe/" + t.split("/")[-1]
+                        return (host["name"], t)
+                    return (host["name"], f"Invalid response: {t[:100]}")
+            return (host["name"], f"HTTP {r.status}")
     except Exception as e:
         return (host["name"], f"Exception: {e}")
 
@@ -838,7 +856,7 @@ def generate_bar(percentage):
 # ───────────────────────────────
 # PROCESS USER
 # ───────────────────────────────
-async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
+async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, newer_than, older_than, max_workers):
     logger.info(f"Processing user: {user}")
     
     search_display = "+".join(user.split())
@@ -872,13 +890,20 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
         )''')
         await db.commit()
         
-        start_url = build_search_url(INITIAL_SEARCH_ID, search_display, NEWER_THAN, OLDER_THAN, title_only=title_only)
+        start_url = build_search_url(INITIAL_SEARCH_ID, search_display, newer_than, older_than, title_only=title_only)
         batch_num = 1
         current_url = start_url
         
-        async with httpx.AsyncClient() as client:
+        # Optimized connector settings for aiohttp
+        connector = aiohttp.TCPConnector(
+            limit=max_workers * 2,
+            limit_per_host=max_workers,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
+        async with aiohttp.ClientSession(connector=connector) as session:
             while current_url:
-                resp = await fetch_page(client, current_url)
+                resp = await fetch_page(session, current_url)
                 if not resp["ok"]:
                     logger.error(f"Failed batch start URL {current_url}")
                     break
@@ -890,9 +915,9 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                 for page_num in range(1, total_pages + 1):
                     match = re.search(r"c\[older_than]=(\d+)", current_url)
                     older_than_ts = match.group(1) if match else None
-                    page_url = build_search_url(search_id, search_display, NEWER_THAN, OLDER_THAN, page_num, 
+                    page_url = build_search_url(search_id, search_display, newer_than, older_than, page_num, 
                                                None if batch_num == 1 else older_than_ts, title_only)
-                    result = await fetch_page(client, page_url)
+                    result = await fetch_page(session, page_url)
                     if not result["ok"]:
                         logger.error(f"Failed page {page_num}")
                         continue
@@ -901,8 +926,8 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                     if not threads:
                         continue
                     
-                    # Process articles
-                    articles = await process_threads_concurrent(threads, PATTERNS)
+                    # Process articles with user-defined max_workers
+                    articles = await process_threads_concurrent(threads, PATTERNS, max_workers)
                     
                     # Extract media and insert into DB
                     for article in articles:
@@ -933,7 +958,7 @@ async def process_user(user, title_only, user_idx, total_users, progress_msg, la
                     await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
                 
                 # Next batch
-                next_url = find_view_older_link(result["html"], title_only)
+                next_url = find_view_older_link(result["html"], newer_than, title_only)
                 if not next_url:
                     break
                 current_url = next_url
@@ -962,13 +987,35 @@ async def handle_message(client: Client, message: Message):
         return
 
     text = message.text.strip()
-    match = re.match(r"(.+?)\s+(\d)$", text)
+    
+    # New format: usernames title_only newer_than older_than max_workers
+    # Example: kiara advani,deepika padukone 0 2024 2025 8
+    match = re.match(r"(.+?)\s+(\d)\s+(\d{4})\s+(\d{4})\s+(\d+)$", text)
     if not match:
-        await message.reply("Invalid format. Use: usernames separated by comma, then 0 or 1 for title_only")
+        await message.reply(
+            "Invalid format. Use:\n"
+            "<usernames separated by comma> <0 or 1> <newer_than> <older_than> <max_workers>\n\n"
+            "Example: kiara advani,deepika 0 2024 2025 8\n\n"
+            "Parameters:\n"
+            "- usernames: comma-separated names\n"
+            "- 0/1: title_only (0=no, 1=yes)\n"
+            "- newer_than: start year (e.g., 2024)\n"
+            "- older_than: end year (e.g., 2025)\n"
+            "- max_workers: concurrent threads (recommended: 4-12)"
+        )
         return
     
     usernames_part = match.group(1)
     title_only = int(match.group(2))
+    newer_than = match.group(3)
+    older_than = match.group(4)
+    max_workers = int(match.group(5))
+    
+    # Validate max_workers
+    if max_workers < 1 or max_workers > 20:
+        await message.reply("max_workers must be between 1 and 20. Recommended: 4-12")
+        return
+    
     usernames = [u.strip() for u in usernames_part.split(',') if u.strip()]
     if not usernames:
         await message.reply("No usernames provided")
@@ -977,13 +1024,21 @@ async def handle_message(client: Client, message: Message):
     total_users = len(usernames)
     last_edit = [0, ""]
     
-    # Send initial progress message
-    progress_msg = await message.reply("Starting processing...")
+    # Send initial progress message with config
+    config_msg = (
+        f"Starting processing...\n"
+        f"Users: {', '.join(usernames)}\n"
+        f"Title Only: {'Yes' if title_only else 'No'}\n"
+        f"Year Range: {newer_than}-{older_than}\n"
+        f"Max Workers: {max_workers}"
+    )
+    progress_msg = await message.reply(config_msg)
     
     for user_idx, user in enumerate(usernames):
         retry_count = 0
         while retry_count < 3:  # Max 3 attempts (initial + 2 retries)
-            await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+            await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit, 
+                             newer_than, older_than, max_workers)
             
             # Check media count for this user
             async with aiosqlite.connect(TEMP_DB) as db:
@@ -1055,8 +1110,10 @@ async def handle_message(client: Client, message: Message):
         # Upload
         with open(OUTPUT_FILE, "rb") as f:
             data = f.read()
-        async with httpx.AsyncClient() as client:
-            tasks = [upload_file(client, h, data) for h in HOSTS]
+        
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [upload_file(session, h, data) for h in HOSTS]
             results = await asyncio.gather(*tasks)
         
         links = []
