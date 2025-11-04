@@ -76,7 +76,7 @@ MAX_PAGINATION_RANGE = 100
 UPLOAD_FILE = "Scraping/final_full_gallery.html"
 MAX_MB = 100
 HOSTS = [
-    {"name":"HTML Hosting","url":"https://html-hosting.tirev71676.workers.dev/api/upload","field":"file"},
+    {"name":"HTML Hosting","url":"https://directproxy.tirev71676.workers.dev/api/upload","field":"file"},
     {"name":"Litterbox","url":"https://litterbox.catbox.moe/resources/internals/api.php","field":"fileToUpload","data":{"reqtype":"fileupload","time":"72h"}},
     {"name":"Catbox","url":"https://catbox.moe/user/api.php","field":"fileToUpload","data":{"reqtype":"fileupload"}}
 ]
